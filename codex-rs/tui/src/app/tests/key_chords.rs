@@ -103,6 +103,34 @@ async fn wrong_second_stroke_passes_through_but_escape_is_consumed() -> Result<(
 }
 
 #[tokio::test]
+async fn non_empty_double_escape_clears_before_empty_escape_backtracks() -> Result<()> {
+    let (mut app, mut tui, mut app_server) = chord_app().await?;
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    app.chat_widget
+        .apply_external_edit("draft text".to_string());
+
+    assert!(!app.should_handle_backtrack_esc(esc));
+    press(&mut app, &mut tui, &mut app_server, esc).await?;
+    assert!(!app.chat_widget.composer_is_empty());
+    assert!(!app.backtrack.primed);
+    assert!(!app.key_chord_matcher.is_pending());
+    let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    assert!(rendered.contains("again to clear input"), "{rendered}");
+
+    press(&mut app, &mut tui, &mut app_server, esc).await?;
+    assert!(
+        app.chat_widget.composer_is_empty(),
+        "{}",
+        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+    );
+    assert!(!app.backtrack.primed);
+
+    press(&mut app, &mut tui, &mut app_server, esc).await?;
+    assert!(app.backtrack.primed);
+    Ok(())
+}
+
+#[tokio::test]
 async fn physical_dispatch_band_events_are_dropped() -> Result<()> {
     let (mut app, mut tui, mut app_server) = chord_app().await?;
     let (code, modifiers) = app
