@@ -37,6 +37,26 @@
 //! records the first-line `/name` token and keeps the popup closed while that token is unchanged.
 //! Editing the command token clears the dismissal and allows the popup to reopen.
 //!
+//! # Esc Esc
+//!
+//! With no popup open, `Esc Esc` means one of two different things depending on whether the
+//! composer holds a draft, and the two are handled by different owners:
+//!
+//! - Empty composer: the App layer routes `Esc` to the backtrack ("edit previous message") state
+//!   machine before it reaches the composer. Direct composer consumers fall back to
+//!   [`FooterMode::EscHint`].
+//! - Non-empty composer: the composer owns the gesture. The first `Esc` arms
+//!   [`FooterMode::EscClearHint`] and the second discards the draft via
+//!   [`ChatComposer::clear_draft_to_history`], returning [`InputResult::DraftCleared`] so the host
+//!   can also append it to persistent history. Clearing empties the composer, so a further
+//!   `Esc Esc` falls through to the backtrack gesture above.
+//!
+//! The clear latch is a dedicated footer mode rather than the shared `EscHint`, because `EscHint`
+//! is also armed by the file popup and by `set_esc_backtrack_hint`, and popup dismissal leaves it
+//! set.
+//! Arming is suppressed while a task is running (Esc is the interrupt gesture) and in Vim normal
+//! mode (Esc is a reflex there); shell-mode `Esc` still exits the `!` prompt first.
+//!
 //! # History Navigation (↑/↓)
 //!
 //! The Up/Down history path is managed by [`ChatComposerHistory`]. It merges:
@@ -354,6 +374,16 @@ pub enum InputResult {
     CommandWithArgs(SlashCommand, String, Vec<TextElement>),
     /// Agent-directed input was attempted while viewing a parent-owned spawned child thread.
     ParentOwnedInputBlocked,
+    /// The composer cleared a non-empty draft in response to `Esc Esc`.
+    ///
+    /// The composer owns the draft reset and the local history entry (see
+    /// [`ChatComposer::clear_draft_to_history`]), but it does not know the active thread, so the
+    /// carried text is handed to the host to append to persistent message history. This mirrors
+    /// what `BottomPane` already does for the Ctrl+C clear; both gestures must produce the same
+    /// recovery affordances.
+    DraftCleared {
+        text: String,
+    },
     None,
 }
 
@@ -1130,6 +1160,7 @@ impl ChatComposer {
     /// In all cases, clears any paste-burst Enter suppression state so a real paste cannot affect
     /// the next user Enter key, then syncs popup state.
     pub fn handle_paste(&mut self, pasted: String) -> bool {
+        self.disarm_esc_clear_hint();
         let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
         let pasted = sanitize_user_text(&pasted);
         let char_count = pasted.chars().count();
@@ -1208,6 +1239,7 @@ impl ChatComposer {
     /// are renumbered to `[Image #M+1]..[Image #N]` (where `M` is the number of
     /// remote images). Cursor is placed at the end after rebuilding elements.
     pub(crate) fn apply_external_edit(&mut self, text: String) {
+        self.disarm_esc_clear_hint();
         self.draft.pending_pastes.clear();
         let (text, _) = self.imported_text_for_textarea(text, Vec::new());
 
@@ -1429,6 +1461,7 @@ impl ChatComposer {
     }
 
     pub(crate) fn set_remote_image_urls(&mut self, urls: Vec<String>) {
+        self.disarm_esc_clear_hint();
         self.attachments
             .set_remote_image_urls(urls, &mut self.draft.textarea);
         self.sync_popups();
@@ -1490,6 +1523,7 @@ impl ChatComposer {
         local_image_paths: Vec<PathBuf>,
         mention_bindings: Vec<MentionBinding>,
     ) {
+        self.disarm_esc_clear_hint();
         // Clear any existing content, placeholders, and attachments first.
         self.draft.textarea.set_text_clearing_elements("");
         self.draft.is_bash_mode = false;
@@ -1647,7 +1681,18 @@ impl ChatComposer {
         }
     }
 
-    pub(crate) fn clear_for_ctrl_c(&mut self) -> Option<String> {
+    /// Discard the entire draft and return the text it held, or `None` when already empty.
+    ///
+    /// This is the single owner of "throw away what the user typed": Ctrl+C and `Esc Esc` both
+    /// route here rather than clearing fields themselves, so the two gestures cannot drift in what
+    /// they reset (text, shell mode, pending pastes, mention bindings, local and remote images) or
+    /// in what they preserve. The discarded draft is recorded as a local history entry so the user
+    /// can recover it with Up, which is why this must not be replaced by a bare
+    /// [`Self::set_text_content`] call.
+    ///
+    /// Callers are responsible for the persistent-history half of the contract; see
+    /// [`InputResult::DraftCleared`].
+    pub(crate) fn clear_draft_to_history(&mut self) -> Option<String> {
         if self.is_empty() {
             return None;
         }
@@ -1756,6 +1801,7 @@ impl ChatComposer {
 
     /// Insert an attachment placeholder and track it for the next submission.
     pub fn attach_image(&mut self, path: PathBuf) {
+        self.disarm_esc_clear_hint();
         self.attachments
             .attach_image(&mut self.draft.textarea, path);
     }
@@ -1883,6 +1929,7 @@ impl ChatComposer {
     }
 
     pub(crate) fn insert_str(&mut self, text: &str) {
+        self.disarm_esc_clear_hint();
         self.draft.textarea.insert_str(text);
         self.sync_bash_mode_from_text();
         self.sync_popups();
@@ -1922,6 +1969,18 @@ impl ChatComposer {
     /// Return true if any popup or history search is active.
     pub(crate) fn popup_active(&self) -> bool {
         self.history_search.is_some() || self.popups.active()
+    }
+
+    pub(crate) fn esc_clear_hint_active(&self) -> bool {
+        self.footer.mode == FooterMode::EscClearHint
+    }
+
+    /// A clear gesture only applies to the draft that was visible when its first Esc was pressed.
+    /// Any out-of-band draft mutation requires a fresh pair of Esc presses.
+    fn disarm_esc_clear_hint(&mut self) {
+        if self.footer.mode == FooterMode::EscClearHint {
+            self.footer.mode = reset_mode_after_activity(self.footer.mode);
+        }
     }
 
     #[inline]
@@ -3308,6 +3367,7 @@ impl ChatComposer {
     /// Handle key event when no popup is visible.
     fn handle_key_event_without_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
         if let Some((result, redraw)) = self.handle_remote_image_selection_key(&key_event) {
+            self.disarm_esc_clear_hint();
             return (result, redraw);
         }
         if self.attachments.selected_remote_image_index.is_some() {
@@ -3374,6 +3434,31 @@ impl ChatComposer {
                 let next_mode = esc_hint_mode(self.footer.mode, self.is_task_running);
                 if next_mode != self.footer.mode {
                     self.footer.mode = next_mode;
+                    return (InputResult::None, true);
+                }
+            } else if !self.is_task_running && !self.draft.textarea.is_vim_normal_mode() {
+                // Esc Esc discards a non-empty draft. The first press only arms the hint; the
+                // second press clears.
+                //
+                // `is_task_running` gates the whole gesture, not just arming: a turn can start
+                // between the two presses, and once it has, Esc belongs to the interrupt gesture.
+                // Consuming a latch armed while idle would clear the draft instead of cancelling.
+                //
+                // Vim normal mode is excluded because Esc there is a no-op users press by reflex,
+                // and a reflex must not be able to destroy a draft.
+                //
+                // The latch is `FooterMode::EscClearHint`, which is armed here and nowhere else.
+                // Matching on the shared `EscHint` mode instead would let a hint left over from a
+                // dismissed popup (that path does not reset the footer) clear the draft on what
+                // the user experiences as a single Esc.
+                if self.footer.mode == FooterMode::EscClearHint
+                    && let Some(text) = self.clear_draft_to_history()
+                {
+                    self.footer.mode = reset_mode_after_activity(self.footer.mode);
+                    return (InputResult::DraftCleared { text }, true);
+                }
+                if self.footer.mode != FooterMode::EscClearHint {
+                    self.footer.mode = FooterMode::EscClearHint;
                     return (InputResult::None, true);
                 }
             }
@@ -3749,6 +3834,9 @@ impl ChatComposer {
         match self.footer.mode {
             FooterMode::HistorySearch => FooterMode::HistorySearch,
             FooterMode::EscHint => FooterMode::EscHint,
+            // The clear hint is only meaningful while the draft it would discard is still there.
+            FooterMode::EscClearHint if !self.is_empty() => FooterMode::EscClearHint,
+            FooterMode::EscClearHint => base_mode,
             FooterMode::ShortcutOverlay => FooterMode::ShortcutOverlay,
             FooterMode::QuitShortcutReminder if self.quit_shortcut_hint_visible() => {
                 FooterMode::QuitShortcutReminder
@@ -4211,6 +4299,12 @@ impl ChatComposer {
     }
 
     pub fn set_task_running(&mut self, running: bool) {
+        // A turn starting takes Esc away from the clear gesture, so a latch armed while idle must
+        // not survive into (or past) the turn. Dropping it here keeps the footer honest while the
+        // task runs and stops the first Esc after the turn from clearing without a fresh arm.
+        if running && self.footer.mode == FooterMode::EscClearHint {
+            self.footer.mode = reset_mode_after_activity(self.footer.mode);
+        }
         self.is_task_running = running;
     }
 
@@ -4501,7 +4595,8 @@ impl ChatComposer {
                     FooterMode::HistorySearch
                     | FooterMode::QuitShortcutReminder
                     | FooterMode::ShortcutOverlay
-                    | FooterMode::EscHint => false,
+                    | FooterMode::EscHint
+                    | FooterMode::EscClearHint => false,
                 };
                 let show_queue_hint = match footer_props.mode {
                     FooterMode::ComposerHasDraft => footer_props.is_task_running,
@@ -4509,7 +4604,8 @@ impl ChatComposer {
                     | FooterMode::QuitShortcutReminder
                     | FooterMode::ComposerEmpty
                     | FooterMode::ShortcutOverlay
-                    | FooterMode::EscHint => false,
+                    | FooterMode::EscHint
+                    | FooterMode::EscClearHint => false,
                 };
                 let custom_height = self.custom_footer_height();
                 let footer_hint_height =
@@ -4655,6 +4751,7 @@ impl ChatComposer {
                                 ))
                             }
                             FooterMode::EscHint
+                            | FooterMode::EscClearHint
                             | FooterMode::HistorySearch
                             | FooterMode::QuitShortcutReminder
                             | FooterMode::ShortcutOverlay => None,
@@ -4663,6 +4760,7 @@ impl ChatComposer {
                     let show_right = if matches!(
                         footer_props.mode,
                         FooterMode::EscHint
+                            | FooterMode::EscClearHint
                             | FooterMode::HistorySearch
                             | FooterMode::QuitShortcutReminder
                             | FooterMode::ShortcutOverlay
@@ -4856,6 +4954,10 @@ impl ChatComposer {
 #[cfg(test)]
 #[path = "chat_composer_effort_tests.rs"]
 mod effort_tests;
+
+#[cfg(test)]
+#[path = "chat_composer/esc_clear_tests.rs"]
+mod esc_clear_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5837,7 +5939,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_hint_stays_hidden_with_draft_content() {
+    fn esc_on_draft_arms_clear_hint() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -5861,7 +5963,7 @@ mod tests {
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        assert_eq!(composer.footer.mode, FooterMode::ComposerEmpty);
+        assert_eq!(composer.footer.mode, FooterMode::EscClearHint);
         assert!(!composer.footer.esc_backtrack_hint);
     }
 
@@ -6093,7 +6195,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_for_ctrl_c_records_cleared_draft() {
+    fn clear_draft_to_history_records_cleared_draft() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
         let mut composer = ChatComposer::new(
@@ -6105,7 +6207,10 @@ mod tests {
         );
 
         composer.set_text_content("draft text".to_string(), Vec::new(), Vec::new());
-        assert_eq!(composer.clear_for_ctrl_c(), Some("draft text".to_string()));
+        assert_eq!(
+            composer.clear_draft_to_history(),
+            Some("draft text".to_string())
+        );
         assert!(composer.is_empty());
 
         assert_eq!(
@@ -6115,7 +6220,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_for_ctrl_c_preserves_pending_paste_history_entry() {
+    fn clear_draft_to_history_preserves_pending_paste_history_entry() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -6140,7 +6245,7 @@ mod tests {
             vec![(placeholder.clone(), large.clone())]
         );
 
-        composer.clear_for_ctrl_c();
+        composer.clear_draft_to_history();
         assert!(composer.is_empty());
 
         let history_entry = composer
@@ -6205,7 +6310,7 @@ mod tests {
         assert_eq!(composer.draft.textarea.text(), base);
         assert_eq!(composer.draft.pending_pastes.len(), 1);
 
-        assert_eq!(composer.clear_for_ctrl_c(), Some(base.clone()));
+        assert_eq!(composer.clear_draft_to_history(), Some(base.clone()));
         assert!(composer.draft.textarea.text().is_empty());
         assert!(composer.draft.pending_pastes.is_empty());
 
@@ -6399,7 +6504,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_for_ctrl_c_preserves_image_draft_state() {
+    fn clear_draft_to_history_preserves_image_draft_state() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
         let mut composer = ChatComposer::new(
@@ -6414,7 +6519,7 @@ mod tests {
         composer.attach_image(path.clone());
         let placeholder = local_image_label_text(/*label_number*/ 1);
 
-        composer.clear_for_ctrl_c();
+        composer.clear_draft_to_history();
         assert!(composer.is_empty());
 
         let history_entry = composer
@@ -6445,7 +6550,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_for_ctrl_c_preserves_remote_offset_image_labels() {
+    fn clear_draft_to_history_preserves_remote_offset_image_labels() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
         let mut composer = ChatComposer::new(
@@ -6472,7 +6577,10 @@ mod tests {
             Some("[Image #2]")
         );
 
-        assert_eq!(composer.clear_for_ctrl_c(), Some(expected_text.clone()));
+        assert_eq!(
+            composer.clear_draft_to_history(),
+            Some(expected_text.clone())
+        );
 
         assert_eq!(
             composer.history.navigate_up(&composer.app_event_tx),
@@ -9451,6 +9559,9 @@ mod tests {
             InputResult::ParentOwnedInputBlocked => {
                 panic!("expected command dispatch, but parent-owned input was blocked")
             }
+            InputResult::DraftCleared { .. } => {
+                panic!("expected command dispatch, but the draft was cleared")
+            }
             InputResult::None => panic!("expected Command result for '/init'"),
         }
         assert!(
@@ -9961,6 +10072,9 @@ mod tests {
             InputResult::ParentOwnedInputBlocked => {
                 panic!("expected command dispatch, but parent-owned input was blocked")
             }
+            InputResult::DraftCleared { .. } => {
+                panic!("expected command dispatch, but the draft was cleared")
+            }
             InputResult::None => panic!("expected Command result for '/diff'"),
         }
         assert!(composer.draft.textarea.is_empty());
@@ -10160,6 +10274,9 @@ mod tests {
             }
             InputResult::ParentOwnedInputBlocked => {
                 panic!("expected command dispatch, but parent-owned input was blocked")
+            }
+            InputResult::DraftCleared { .. } => {
+                panic!("expected command dispatch, but the draft was cleared")
             }
             InputResult::None => panic!("expected Command result for '/mention'"),
         }

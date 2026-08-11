@@ -169,6 +169,15 @@ pub(crate) enum FooterMode {
     ShortcutOverlay,
     /// Transient "press Esc again" hint shown after the first Esc while idle.
     EscHint,
+    /// Transient "press Esc again to clear" hint shown after the first Esc on a non-empty draft.
+    ///
+    /// This is deliberately a separate mode from [`FooterMode::EscHint`] rather than a shared
+    /// "an Esc was seen" latch. `EscHint` is also armed by the file popup and by
+    /// `set_esc_backtrack_hint`, and popup dismissal does not reset it, so a mode-equality test
+    /// against `EscHint` would let a leaked hint clear a draft on a single Esc. Only the
+    /// no-popup, non-empty composer path arms this mode, which is what makes the clear gesture
+    /// structurally unreachable from those other paths.
+    EscClearHint,
     /// Base single-line footer when the composer is empty.
     ComposerEmpty,
     /// Base single-line footer when the composer contains a draft.
@@ -210,6 +219,7 @@ pub(crate) fn esc_hint_mode(current: FooterMode, is_task_running: bool) -> Foote
 pub(crate) fn reset_mode_after_activity(current: FooterMode) -> FooterMode {
     match current {
         FooterMode::EscHint
+        | FooterMode::EscClearHint
         | FooterMode::ShortcutOverlay
         | FooterMode::QuitShortcutReminder
         | FooterMode::HistorySearch
@@ -225,7 +235,8 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
         FooterMode::HistorySearch
         | FooterMode::QuitShortcutReminder
         | FooterMode::ShortcutOverlay
-        | FooterMode::EscHint => false,
+        | FooterMode::EscHint
+        | FooterMode::EscClearHint => false,
     };
     let show_queue_hint = match props.mode {
         FooterMode::ComposerHasDraft => props.is_task_running,
@@ -233,7 +244,8 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
         | FooterMode::HistorySearch
         | FooterMode::ComposerEmpty
         | FooterMode::ShortcutOverlay
-        | FooterMode::EscHint => false,
+        | FooterMode::EscHint
+        | FooterMode::EscClearHint => false,
     };
     footer_from_props_lines(
         props,
@@ -743,6 +755,7 @@ fn footer_from_props_lines(
             shortcut_overlay_lines(state)
         }
         FooterMode::EscHint => vec![esc_hint_line(props.esc_backtrack_hint)],
+        FooterMode::EscClearHint => vec![esc_clear_hint_line()],
         FooterMode::ComposerHasDraft => {
             let state = LeftSideState {
                 hint: if show_queue_hint {
@@ -802,7 +815,8 @@ pub(crate) fn shows_passive_footer_line(props: &FooterProps) -> bool {
         FooterMode::HistorySearch
         | FooterMode::QuitShortcutReminder
         | FooterMode::ShortcutOverlay
-        | FooterMode::EscHint => false,
+        | FooterMode::EscHint
+        | FooterMode::EscClearHint => false,
     }
 }
 
@@ -882,6 +896,15 @@ fn esc_hint_line(esc_backtrack_hint: bool) -> Line<'static> {
         ])
         .dim()
     }
+}
+
+/// Hint shown after the first Esc on a non-empty composer.
+///
+/// The backtrack wording is deliberately absent here: with a draft in the composer the next Esc
+/// clears the draft, and the backtrack overlay is only reachable once the composer is empty again.
+fn esc_clear_hint_line() -> Line<'static> {
+    let esc = key_hint::plain(KeyCode::Esc);
+    Line::from(vec![esc.into(), " again to clear input".into()]).dim()
 }
 
 fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
@@ -1318,7 +1341,8 @@ mod tests {
                     FooterMode::HistorySearch
                     | FooterMode::QuitShortcutReminder
                     | FooterMode::ShortcutOverlay
-                    | FooterMode::EscHint => false,
+                    | FooterMode::EscHint
+                    | FooterMode::EscClearHint => false,
                 };
                 let show_queue_hint = match props.mode {
                     FooterMode::ComposerHasDraft => props.is_task_running,
@@ -1326,7 +1350,8 @@ mod tests {
                     | FooterMode::QuitShortcutReminder
                     | FooterMode::ComposerEmpty
                     | FooterMode::ShortcutOverlay
-                    | FooterMode::EscHint => false,
+                    | FooterMode::EscHint
+                    | FooterMode::EscClearHint => false,
                 };
                 let status_line_active = uses_passive_footer_status_layout(props);
                 let passive_status_line = if status_line_active {
@@ -1681,6 +1706,24 @@ mod tests {
             FooterProps {
                 mode: FooterMode::EscHint,
                 esc_backtrack_hint: true,
+                use_shift_enter_hint: false,
+                is_task_running: false,
+                queue_submissions: false,
+                collaboration_modes_enabled: false,
+                is_wsl: false,
+                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+                status_line_value: None,
+                status_line_enabled: false,
+                key_hints: FooterKeyHints::default_bindings(),
+                active_agent_label: None,
+            },
+        );
+
+        snapshot_footer(
+            "footer_esc_clear_hint",
+            FooterProps {
+                mode: FooterMode::EscClearHint,
+                esc_backtrack_hint: false,
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 queue_submissions: false,

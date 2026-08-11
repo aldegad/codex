@@ -73,6 +73,9 @@ impl ChatWidget {
             InputResult::ParentOwnedInputBlocked => {
                 self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
             }
+            // `BottomPane` consumes this variant when routing the key, so it never reaches the
+            // widget; the arm exists so a future route cannot silently drop the cleared draft.
+            InputResult::DraftCleared { .. } => {}
             InputResult::None => {}
         }
         if had_modal_or_popup && self.bottom_pane.no_modal_or_popup_active() {

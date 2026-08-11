@@ -683,7 +683,13 @@ impl BottomPane {
                             | KeyCode::Enter
                             | KeyCode::Tab
                     );
-            let (input_result, needs_redraw) = self.composer.handle_key_event(key_event);
+            let (mut input_result, needs_redraw) = self.composer.handle_key_event(key_event);
+            // The composer owns the draft reset but not the thread, so it hands the discarded
+            // text back for the persistent-history half of the clear contract.
+            if let InputResult::DraftCleared { text } = input_result {
+                self.append_cleared_draft_to_history(text);
+                input_result = InputResult::None;
+            }
             if records_composer_activity {
                 self.record_composer_activity_at(Instant::now());
             }
@@ -861,17 +867,24 @@ impl BottomPane {
     }
 
     pub(crate) fn clear_composer_for_ctrl_c(&mut self) {
-        if let Some(text) = self.composer.clear_for_ctrl_c() {
-            if let Some(thread_id) = self.thread_id {
-                self.app_event_tx
-                    .send(AppEvent::AppendMessageHistoryEntry { thread_id, text });
-            } else {
-                tracing::warn!(
-                    "failed to append Ctrl+C-cleared draft to history: no active thread id"
-                );
-            }
+        if let Some(text) = self.composer.clear_draft_to_history() {
+            self.append_cleared_draft_to_history(text);
         }
         self.request_redraw();
+    }
+
+    /// Persist a draft that a clear gesture discarded.
+    ///
+    /// Every gesture that throws away composer input funnels through here, so Ctrl+C and
+    /// `Esc Esc` cannot end up with different recovery guarantees: the composer keeps the local
+    /// history entry, and this keeps the cross-session one.
+    fn append_cleared_draft_to_history(&mut self, text: String) {
+        if let Some(thread_id) = self.thread_id {
+            self.app_event_tx
+                .send(AppEvent::AppendMessageHistoryEntry { thread_id, text });
+        } else {
+            tracing::warn!("failed to append cleared draft to history: no active thread id");
+        }
     }
 
     /// Get the current composer text (for tests and programmatic checks).
@@ -1426,6 +1439,10 @@ impl BottomPane {
     /// running and some are not.
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
         self.can_launch_external_editor()
+    }
+
+    pub(crate) fn esc_clear_hint_active(&self) -> bool {
+        self.composer.esc_clear_hint_active()
     }
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
@@ -2081,6 +2098,31 @@ mod tests {
         assert_eq!(pane.composer_text(), "draft");
         assert!(!pane.composer.popup_active());
         assert!(!pane.quit_shortcut_hint_visible());
+    }
+
+    #[test]
+    fn esc_esc_clear_appends_the_discarded_draft_to_message_history() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = test_pane(tx);
+        let thread_id = ThreadId::new();
+        pane.set_history_metadata(thread_id, /*log_id*/ 0, /*entry_count*/ 0);
+        pane.insert_str("draft text");
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(pane.composer_is_empty());
+        match rx.try_recv().expect("expected cleared draft history event") {
+            AppEvent::AppendMessageHistoryEntry {
+                thread_id: event_thread_id,
+                text,
+            } => {
+                assert_eq!(event_thread_id, thread_id);
+                assert_eq!(text, "draft text");
+            }
+            event => panic!("expected cleared draft history event, got {event:?}"),
+        }
     }
 
     // live ring removed; related tests deleted.
